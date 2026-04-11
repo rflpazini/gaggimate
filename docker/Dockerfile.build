@@ -1,60 +1,112 @@
+# syntax=docker/dockerfile:1
 # GaggiMate firmware + web build environment
 #
-# Provides a reproducible build environment with:
-#   - Python 3.12 + PlatformIO (firmware builds)
-#   - Node.js 22 (web UI builds)
+# Multi-stage build — three independent stages:
+#   pio-builder   Install PlatformIO and pre-warm the espressif32 platform
+#                 (~200 MB download, cached separately from Node.js)
+#   node-builder  Install Node.js 22 via NodeSource, isolated from PlatformIO
+#   final         Combine both, minimal runtime deps only
+#
+# Stages 1 and 2 are built in parallel by BuildKit and do not share layers,
+# so bumping the Node.js version never re-downloads the ESP32 platform and
+# bumping PlatformIO never re-runs the NodeSource setup script.
 #
 # Usage (firmware):
 #   docker build -f docker/Dockerfile.build -t gaggimate-build .
 #   docker run --rm -v "$(pwd)":/workspace gaggimate-build pio run -e display
 #   docker run --rm -v "$(pwd)":/workspace gaggimate-build pio run -e controller
 #
-# Usage (web UI + SPIFFS):
+# Usage (web UI + SPIFFS image):
 #   docker run --rm -v "$(pwd)":/workspace gaggimate-build ./scripts/build_spiffs.sh
 #
 # Usage (interactive shell):
 #   docker run --rm -it -v "$(pwd)":/workspace gaggimate-build bash
 
-FROM ubuntu:24.04
+# ─── Stage 1: PlatformIO + espressif32 platform ──────────────────────────────
+# Re-runs only when the PlatformIO pip version or the platform version changes.
+FROM ubuntu:24.04 AS pio-builder
 
-LABEL org.opencontainers.image.title="GaggiMate Build Environment" \
-      org.opencontainers.image.description="Reproducible firmware and web build environment for GaggiMate" \
-      org.opencontainers.image.source="https://github.com/jniebuhr/gaggimate"
+ENV DEBIAN_FRONTEND=noninteractive \
+    # Fixed, user-agnostic data dir so the path survives the COPY into the
+    # final stage regardless of which user runs the container.
+    PLATFORMIO_CORE_DIR=/opt/pio-core
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-# System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
-    curl \
-    git \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Node.js 22 (matches .nvmrc lts/jod)
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# PlatformIO in an isolated virtualenv to avoid system-pip conflicts
+# PlatformIO in an isolated virtualenv (avoids system-pip conflicts)
 RUN python3 -m venv /opt/pio \
     && /opt/pio/bin/pip install --upgrade pip \
     && /opt/pio/bin/pip install platformio
 
 ENV PATH="/opt/pio/bin:$PATH"
 
-# Non-root user for builds (matches CI runner behaviour)
+# Pre-warm the espressif32 platform into PLATFORMIO_CORE_DIR.
+# This layer is ~200 MB and is cached independently of everything below it.
+RUN pio pkg install --global --platform "espressif32@6.12.0" 2>/dev/null || true
+
+
+# ─── Stage 2: Node.js 22 installer ───────────────────────────────────────────
+# Re-runs only when the Node.js major version changes.
+# The NodeSource setup script and apt residue stay in this stage only.
+FROM ubuntu:24.04 AS node-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 (matches .nvmrc lts/jod = v22)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# ─── Stage 3: Final image ─────────────────────────────────────────────────────
+# Pulls only the outputs of the two builder stages — no pip, no curl scripts,
+# no apt cache from the setup stages.
+FROM ubuntu:24.04
+
+LABEL org.opencontainers.image.title="GaggiMate Build Environment" \
+      org.opencontainers.image.description="Reproducible firmware and web build environment for GaggiMate" \
+      org.opencontainers.image.source="https://github.com/jniebuhr/gaggimate"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PLATFORMIO_CORE_DIR=/opt/pio-core \
+    PATH="/opt/pio/bin:$PATH"
+
+# Minimal runtime system deps — python3 for PlatformIO, git for pio pkg,
+# ca-certificates for TLS. No pip, no curl.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# PlatformIO virtualenv from stage 1
+COPY --from=pio-builder /opt/pio /opt/pio
+
+# Pre-warmed espressif32 platform + package registry from stage 1
+COPY --from=pio-builder /opt/pio-core /opt/pio-core
+
+# Node.js binary + npm/npx from stage 2
+COPY --from=node-builder /usr/bin/node /usr/bin/node
+COPY --from=node-builder /usr/bin/npm  /usr/bin/npm
+COPY --from=node-builder /usr/bin/npx  /usr/bin/npx
+COPY --from=node-builder /usr/lib/node_modules /usr/lib/node_modules
+
+# Non-root user (uid 1000 matches most CI runners).
+# PLATFORMIO_CORE_DIR is in /opt so ownership is set there, not in $HOME.
 RUN useradd -m -u 1000 -s /bin/bash builder \
-    && mkdir -p /home/builder/.platformio \
-    && chown -R builder:builder /home/builder
+    && chown -R builder:builder /opt/pio-core
 
 USER builder
-
-# Pre-warm the PlatformIO package registry and espressif32 platform so the
-# first real build does not re-download everything from scratch.
-RUN pio pkg install --global --platform "espressif32@6.12.0" 2>/dev/null || true
 
 WORKDIR /workspace
 
