@@ -1,0 +1,61 @@
+# GaggiMate firmware + web build environment
+#
+# Provides a reproducible build environment with:
+#   - Python 3.12 + PlatformIO (firmware builds)
+#   - Node.js 22 (web UI builds)
+#
+# Usage (firmware):
+#   docker build -f docker/Dockerfile.build -t gaggimate-build .
+#   docker run --rm -v "$(pwd)":/workspace gaggimate-build pio run -e display
+#   docker run --rm -v "$(pwd)":/workspace gaggimate-build pio run -e controller
+#
+# Usage (web UI + SPIFFS):
+#   docker run --rm -v "$(pwd)":/workspace gaggimate-build ./scripts/build_spiffs.sh
+#
+# Usage (interactive shell):
+#   docker run --rm -it -v "$(pwd)":/workspace gaggimate-build bash
+
+FROM ubuntu:24.04
+
+LABEL org.opencontainers.image.title="GaggiMate Build Environment" \
+      org.opencontainers.image.description="Reproducible firmware and web build environment for GaggiMate" \
+      org.opencontainers.image.source="https://github.com/jniebuhr/gaggimate"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    curl \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 (matches .nvmrc lts/jod)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# PlatformIO in an isolated virtualenv to avoid system-pip conflicts
+RUN python3 -m venv /opt/pio \
+    && /opt/pio/bin/pip install --upgrade pip \
+    && /opt/pio/bin/pip install platformio
+
+ENV PATH="/opt/pio/bin:$PATH"
+
+# Non-root user for builds (matches CI runner behaviour)
+RUN useradd -m -u 1000 -s /bin/bash builder \
+    && mkdir -p /home/builder/.platformio \
+    && chown -R builder:builder /home/builder
+
+USER builder
+
+# Pre-warm the PlatformIO package registry and espressif32 platform so the
+# first real build does not re-download everything from scratch.
+RUN pio pkg install --global --platform "espressif32@6.12.0" 2>/dev/null || true
+
+WORKDIR /workspace
+
+CMD ["bash"]
